@@ -1,23 +1,37 @@
 """
-Phase Tracker — Streamlit edition
+Phase Tracker — Streamlit edition (Google Sheets storage)
 Run with:  streamlit run phase_tracker_streamlit.py
-Requires:  pip install streamlit pandas
+Requires:  pip install streamlit pandas gspread google-auth
+
+Every game (in progress and finished) is stored as a row in a Google Sheet,
+so history survives redeploys and is shared across anyone using the app.
+See the setup steps for connecting your own sheet + service account.
 """
 
-import streamlit as st
+import json
+import uuid
+from datetime import datetime
+
 import pandas as pd
+import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 PHASE_COUNT = 10
+SHEET_COLUMNS = ["id", "created_at", "updated_at", "finished_at", "base_players", "history"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 # ---------------------------------------------------------------------------
-# Core game logic (framework-agnostic — same rules as the React version)
+# Core game logic (framework-agnostic)
 # ---------------------------------------------------------------------------
 
 def replay(base_players, history):
     """Rebuild every player's current state by replaying the full round
-    history from scratch. This is the single source of truth: editing an
-    old round just means editing an entry in `history`, and everything
-    downstream (phase, completed phases, totals) recomputes correctly."""
+    history from scratch. Editing an old round just means editing an entry
+    in `history` — everything downstream recomputes correctly."""
     state = {}
     for p in base_players:
         state[p["id"]] = {
@@ -36,7 +50,7 @@ def replay(base_players, history):
         for p in base_players:
             s = state[p["id"]]
             if s["finished"]:
-                continue  # sat out this round
+                continue
             raw = round_data["entries"].get(p["id"], {"score": 0, "completed": False})
             phase_index = s["current_phase"] - 1
             phase_at_round = s["current_phase"]
@@ -67,12 +81,11 @@ def replay(base_players, history):
 def rank_players(players):
     def sort_key(p):
         phase_rank = PHASE_COUNT + 1 if p["finished"] else p["current_phase"]
-        return (-phase_rank, p["total_score"])  # further phase first, then lower score
+        return (-phase_rank, p["total_score"])
     return sorted(players, key=sort_key)
 
 
 def zero_rule_valid(active_ids, inputs):
-    """Exactly one active player must score 0 this round (the round winner)."""
     if not active_ids:
         return True
     zero_count = sum(1 for pid in active_ids if inputs.get(pid, {}).get("score", 0) == 0)
@@ -80,14 +93,97 @@ def zero_rule_valid(active_ids, inputs):
 
 
 # ---------------------------------------------------------------------------
-# Streamlit state setup
+# Persistence — Google Sheets, one row per game
+# ---------------------------------------------------------------------------
+
+def sheets_configured():
+    return "gcp_service_account" in st.secrets and "gsheet" in st.secrets
+
+
+@st.cache_resource(show_spinner=False)
+def get_client():
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+@st.cache_resource(show_spinner=False)
+def get_worksheet():
+    client = get_client()
+    spreadsheet_id = st.secrets["gsheet"]["spreadsheet_id"]
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        ws = sh.worksheet("games")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="games", rows=1000, cols=len(SHEET_COLUMNS))
+    header = ws.row_values(1)
+    if header != SHEET_COLUMNS:
+        ws.clear()
+        ws.append_row(SHEET_COLUMNS)
+    return ws
+
+
+def _find_row(ws, game_id):
+    ids = ws.col_values(1)
+    for i, val in enumerate(ids[1:], start=2):  # sheet rows are 1-indexed; row 1 is the header
+        if val == game_id:
+            return i
+    return None
+
+
+def create_game(base_players):
+    ws = get_worksheet()
+    game_id = uuid.uuid4().hex[:10]
+    now = datetime.utcnow().isoformat()
+    ws.append_row([game_id, now, now, "", json.dumps(base_players), json.dumps([])])
+    return game_id
+
+
+def update_game_history(game_id, history):
+    ws = get_worksheet()
+    row = _find_row(ws, game_id)
+    if row is None:
+        return
+    now = datetime.utcnow().isoformat()
+    ws.update_cell(row, 3, now)  # updated_at
+    ws.update_cell(row, 6, json.dumps(history))  # history
+
+
+def finish_game(game_id):
+    ws = get_worksheet()
+    row = _find_row(ws, game_id)
+    if row is None:
+        return
+    now = datetime.utcnow().isoformat()
+    ws.update_cell(row, 3, now)  # updated_at
+    ws.update_cell(row, 4, now)  # finished_at
+
+
+def list_games():
+    ws = get_worksheet()
+    records = ws.get_all_records()
+    records.sort(key=lambda r: r["created_at"], reverse=True)
+    return records
+
+
+def get_unfinished_game():
+    for g in list_games():
+        if not g["finished_at"]:
+            return g
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Session state
 # ---------------------------------------------------------------------------
 
 def init_state():
     if "started" not in st.session_state:
         st.session_state.started = False
+        st.session_state.game_id = None
         st.session_state.base_players = []
         st.session_state.history = []
+        st.session_state.finished_saved = False
 
 
 def start_game(names):
@@ -95,19 +191,26 @@ def start_game(names):
         {"id": f"p{i}", "name": n.strip() if n.strip() else f"Player {i + 1}"}
         for i, n in enumerate(names)
     ]
+    game_id = create_game(base_players)
     st.session_state.base_players = base_players
     st.session_state.history = []
+    st.session_state.game_id = game_id
     st.session_state.started = True
+    st.session_state.finished_saved = False
 
 
 def reset_game():
+    if st.session_state.get("game_id"):
+        finish_game(st.session_state.game_id)  # archive whatever was played, even if incomplete
     st.session_state.started = False
+    st.session_state.game_id = None
     st.session_state.base_players = []
     st.session_state.history = []
+    st.session_state.finished_saved = False
 
 
 # ---------------------------------------------------------------------------
-# Styling — light theming to match the tabletop scorepad look
+# Styling
 # ---------------------------------------------------------------------------
 
 def inject_css():
@@ -151,6 +254,28 @@ def render_setup():
     st.title("Phase Tracker")
     st.caption("10-phase scorepad")
 
+    unfinished = get_unfinished_game()
+    if unfinished is not None:
+        base_players = json.loads(unfinished["base_players"])
+        history = json.loads(unfinished["history"])
+        names_preview = ", ".join(p["name"] for p in base_players)
+        when = str(unfinished["created_at"])[:16].replace("T", " ")
+        st.info(f"Game in progress from {when} — {names_preview} ({len(history)} rounds played).")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Resume this game"):
+                st.session_state.game_id = unfinished["id"]
+                st.session_state.base_players = base_players
+                st.session_state.history = history
+                st.session_state.started = True
+                st.session_state.finished_saved = False
+                st.rerun()
+        with col2:
+            if st.button("Discard and start fresh"):
+                finish_game(unfinished["id"])
+                st.rerun()
+        st.divider()
+
     num_players = st.number_input("Number of players", min_value=2, max_value=12, value=4, step=1)
 
     names = []
@@ -165,7 +290,7 @@ def render_setup():
 
 
 # ---------------------------------------------------------------------------
-# Leaderboard + dashboards
+# Leaderboard, chart, filters, dashboards
 # ---------------------------------------------------------------------------
 
 def render_leaderboard(ranked):
@@ -181,6 +306,38 @@ def render_leaderboard(ranked):
         })
     df = pd.DataFrame(rows).set_index("Rank")
     st.table(df)
+
+
+def render_bar_chart(ranked):
+    st.subheader("Total score by rank")
+    labels = [f"#{i + 1} {p['name']}" for i, p in enumerate(ranked)]
+    df = pd.DataFrame({"Total score": [p["total_score"] for p in ranked]}, index=labels)
+    st.bar_chart(df)
+
+
+def render_phase_filter_table(players, key_prefix="live"):
+    st.subheader("Phase score breakdown")
+    all_names = [p["name"] for p in players]
+    selected_players = st.multiselect(
+        "Filter by player", options=all_names, default=all_names, key=f"{key_prefix}_player_filter"
+    )
+    selected_phases = st.multiselect(
+        "Filter by phase",
+        options=list(range(1, PHASE_COUNT + 1)),
+        default=list(range(1, PHASE_COUNT + 1)),
+        format_func=lambda x: f"Phase {x}",
+        key=f"{key_prefix}_phase_filter",
+    )
+    if not selected_players or not selected_phases:
+        st.info("Select at least one player and one phase to see the table.")
+        return
+    rows = {}
+    for p in players:
+        if p["name"] not in selected_players:
+            continue
+        rows[p["name"]] = [p["phase_scores"][ph - 1] for ph in selected_phases]
+    df = pd.DataFrame(rows, index=[f"Phase {ph}" for ph in selected_phases]).T
+    st.dataframe(df, use_container_width=True)
 
 
 def render_dashboards(ranked):
@@ -225,9 +382,7 @@ def render_round_entry(players, round_number):
                     key=f"score_{p['id']}_{round_number}", label_visibility="collapsed",
                 )
             with col3:
-                completed = st.checkbox(
-                    "Completed", key=f"done_{p['id']}_{round_number}",
-                )
+                completed = st.checkbox("Completed", key=f"done_{p['id']}_{round_number}")
             inputs[p["id"]] = {"score": score, "completed": completed}
 
         for p in finished_players:
@@ -241,6 +396,7 @@ def render_round_entry(players, round_number):
                 st.error("Exactly one player must score 0 this round.")
             else:
                 st.session_state.history.append({"round": round_number, "entries": inputs})
+                update_game_history(st.session_state.game_id, st.session_state.history)
                 st.rerun()
 
 
@@ -273,8 +429,7 @@ def render_history(annotated_history):
                         )
                     with col3:
                         completed = st.checkbox(
-                            "Completed", value=e["completed"],
-                            key=f"edit_done_{round_num}_{e['player_id']}",
+                            "Completed", value=e["completed"], key=f"edit_done_{round_num}_{e['player_id']}"
                         )
                     draft[e["player_id"]] = {"score": score, "completed": completed}
 
@@ -288,7 +443,45 @@ def render_history(annotated_history):
                             if h["round"] == round_num:
                                 h["entries"] = draft
                                 break
+                        update_game_history(st.session_state.game_id, st.session_state.history)
                         st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Past games archive
+# ---------------------------------------------------------------------------
+
+def render_past_games():
+    st.title("Past games")
+    games = list_games()
+    if not games:
+        st.info("No games recorded yet — play a game and it'll show up here.")
+        return
+
+    for g in games:
+        base_players = json.loads(g["base_players"])
+        history = json.loads(g["history"]) if g["history"] else []
+        players, annotated_history = replay(base_players, history)
+        ranked = rank_players(players)
+        status = "Finished" if g["finished_at"] else "In progress"
+        when = str(g["created_at"])[:16].replace("T", " ")
+        winner = ranked[0]["name"] if ranked else "—"
+        label = f"{when} · {status} · {len(history)} rounds · leader: {winner}"
+
+        with st.expander(label):
+            if not ranked:
+                st.caption("No rounds were played in this game.")
+                continue
+            render_leaderboard(ranked)
+            render_bar_chart(ranked)
+            render_phase_filter_table(players, key_prefix=f"game_{g['id']}")
+            if annotated_history:
+                st.write("Round-by-round")
+                for r in annotated_history:
+                    summary = " · ".join(
+                        f"{e['player_name']} +{e['score']}{'✔' if e['completed'] else ''}" for e in r["entries"]
+                    )
+                    st.caption(f"Round {r['round']}: {summary}")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +491,36 @@ def render_history(annotated_history):
 def main():
     st.set_page_config(page_title="Phase Tracker", page_icon="🂡", layout="centered")
     inject_css()
+
+    if not sheets_configured():
+        st.title("Phase Tracker")
+        st.error("Google Sheets isn't connected yet.")
+        st.markdown(
+            "Add your service-account credentials and spreadsheet ID to `.streamlit/secrets.toml` "
+            "(locally) or to your app's **Secrets** settings (on Streamlit Community Cloud). "
+            "See the setup steps for the exact format."
+        )
+        st.stop()
+
+    try:
+        get_worksheet()
+    except Exception as e:
+        st.title("Phase Tracker")
+        st.error(f"Couldn't reach the Google Sheet: {e}")
+        st.markdown(
+            "Double check that: the spreadsheet ID in secrets is correct, the Sheets and Drive APIs "
+            "are enabled on your Google Cloud project, and the sheet is shared with your service "
+            "account's email as an Editor."
+        )
+        st.stop()
+
     init_state()
+
+    page = st.sidebar.radio("View", ["Play", "Past games"])
+
+    if page == "Past games":
+        render_past_games()
+        return
 
     if not st.session_state.started:
         render_setup()
@@ -308,6 +530,10 @@ def main():
     ranked = rank_players(players)
     all_finished = len(players) > 0 and all(p["finished"] for p in players)
     next_round = len(st.session_state.history) + 1
+
+    if all_finished and not st.session_state.finished_saved:
+        finish_game(st.session_state.game_id)
+        st.session_state.finished_saved = True
 
     top_left, top_right = st.columns([4, 1])
     with top_left:
@@ -319,6 +545,8 @@ def main():
             st.rerun()
 
     render_leaderboard(ranked)
+    render_bar_chart(ranked)
+    render_phase_filter_table(players, key_prefix="live")
     render_dashboards(ranked)
 
     st.divider()
