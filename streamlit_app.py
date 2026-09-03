@@ -1,17 +1,17 @@
 """
 Phase Tracker — Streamlit edition (Google Sheets storage)
 Run with:  streamlit run phase_tracker_streamlit.py
-Requires:  pip install streamlit pandas gspread google-auth
+Requires:  pip install streamlit pandas altair gspread google-auth
 
 Every game (in progress and finished) is stored as a row in a Google Sheet,
 so history survives redeploys and is shared across anyone using the app.
-See the setup steps for connecting your own sheet + service account.
 """
 
 import json
 import uuid
 from datetime import datetime
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 import gspread
@@ -23,6 +23,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+INK = "#1E2A24"
+CARD = "#F6F1E3"
+CARD_LINE = "#DCD0AE"
+GOLD = "#C69A3B"
+GOLD_DEEP = "#A97F2C"
+MUTED = "#6B6350"  # darkened from the original for better contrast on light backgrounds
 
 # ---------------------------------------------------------------------------
 # Core game logic (framework-agnostic)
@@ -125,7 +132,7 @@ def get_worksheet():
 
 def _find_row(ws, game_id):
     ids = ws.col_values(1)
-    for i, val in enumerate(ids[1:], start=2):  # sheet rows are 1-indexed; row 1 is the header
+    for i, val in enumerate(ids[1:], start=2):
         if val == game_id:
             return i
     return None
@@ -145,8 +152,8 @@ def update_game_history(game_id, history):
     if row is None:
         return
     now = datetime.utcnow().isoformat()
-    ws.update_cell(row, 3, now)  # updated_at
-    ws.update_cell(row, 6, json.dumps(history))  # history
+    ws.update_cell(row, 3, now)
+    ws.update_cell(row, 6, json.dumps(history))
 
 
 def finish_game(game_id):
@@ -155,8 +162,8 @@ def finish_game(game_id):
     if row is None:
         return
     now = datetime.utcnow().isoformat()
-    ws.update_cell(row, 3, now)  # updated_at
-    ws.update_cell(row, 4, now)  # finished_at
+    ws.update_cell(row, 3, now)
+    ws.update_cell(row, 4, now)
 
 
 def list_games():
@@ -184,6 +191,7 @@ def init_state():
         st.session_state.base_players = []
         st.session_state.history = []
         st.session_state.finished_saved = False
+        st.session_state.show_celebration = False
 
 
 def start_game(names):
@@ -197,16 +205,18 @@ def start_game(names):
     st.session_state.game_id = game_id
     st.session_state.started = True
     st.session_state.finished_saved = False
+    st.session_state.show_celebration = False
 
 
 def reset_game():
     if st.session_state.get("game_id"):
-        finish_game(st.session_state.game_id)  # archive whatever was played, even if incomplete
+        finish_game(st.session_state.game_id)
     st.session_state.started = False
     st.session_state.game_id = None
     st.session_state.base_players = []
     st.session_state.history = []
     st.session_state.finished_saved = False
+    st.session_state.show_celebration = False
 
 
 # ---------------------------------------------------------------------------
@@ -215,31 +225,52 @@ def reset_game():
 
 def inject_css():
     st.markdown(
-        """
+        f"""
         <style>
-        .stApp { background: radial-gradient(ellipse at top, #122A22 0%, #0D1F19 100%); }
-        h1, h2, h3 { font-family: Georgia, 'Iowan Old Style', serif; color: #F6F1E3 !important; }
-        .block-container { padding-top: 2rem; }
-        div[data-testid="stForm"] {
-            background: #F6F1E3;
-            border: 1px solid #DCD0AE;
+        .stApp {{ background: radial-gradient(ellipse at top, #122A22 0%, #0D1F19 100%); }}
+        h1, h2, h3 {{ font-family: Georgia, 'Iowan Old Style', serif; color: #F6F1E3 !important; }}
+        .block-container {{ padding-top: 2rem; }}
+        div[data-testid="stForm"] {{
+            background: {CARD};
+            border: 1px solid {CARD_LINE};
             border-radius: 6px;
             padding: 1.1rem 1.2rem;
-        }
-        div[data-testid="stExpander"] {
-            background: #F6F1E3;
-            border: 1px solid #DCD0AE;
+        }}
+        div[data-testid="stExpander"] {{
+            background: {CARD};
+            border: 1px solid {CARD_LINE};
             border-radius: 6px;
-        }
-        .stButton button {
-            background-color: #A97F2C;
+        }}
+        .stButton button {{
+            background-color: {GOLD_DEEP};
             color: #FBF6E9;
             border: none;
-        }
-        .stButton button:hover {
-            background-color: #C69A3B;
+        }}
+        .stButton button:hover {{
+            background-color: {GOLD};
             color: #FBF6E9;
-        }
+        }}
+        /* Force legible text on tables/dataframes regardless of light/dark theme */
+        div[data-testid="stTable"] {{
+            background: {CARD};
+            border: 1px solid {CARD_LINE};
+            border-radius: 4px;
+            padding: 6px 4px;
+        }}
+        div[data-testid="stTable"] table {{ color: {INK} !important; }}
+        div[data-testid="stTable"] th {{
+            color: {INK} !important;
+            background: {CARD} !important;
+            border-bottom: 1px solid {CARD_LINE} !important;
+        }}
+        div[data-testid="stTable"] td {{
+            color: {INK} !important;
+            background: #FDFBF6 !important;
+        }}
+        div[data-testid="stDataFrame"] {{
+            background: {CARD};
+            border-radius: 4px;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -308,11 +339,26 @@ def render_leaderboard(ranked):
     st.table(df)
 
 
-def render_bar_chart(ranked):
+def render_bar_chart(ranked, key_prefix="live"):
     st.subheader("Total score by rank")
-    labels = [f"#{i + 1} {p['name']}" for i, p in enumerate(ranked)]
-    df = pd.DataFrame({"Total score": [p["total_score"] for p in ranked]}, index=labels)
-    st.bar_chart(df)
+    df = pd.DataFrame({
+        "Player": [f"#{i + 1} {p['name']}" for i, p in enumerate(ranked)],
+        "Total score": [p["total_score"] for p in ranked],
+    })
+    order = list(df["Player"])
+    bars = (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Player:N", sort=order, title=None, axis=alt.Axis(labelAngle=-20)),
+            y=alt.Y("Total score:Q"),
+            color=alt.Color("Player:N", sort=order, legend=None, scale=alt.Scale(scheme="tableau20")),
+            tooltip=["Player", "Total score"],
+        )
+    )
+    labels = bars.mark_text(dy=-8, color="#F6F1E3", fontSize=13).encode(text="Total score:Q")
+    chart = (bars + labels).properties(height=320)
+    st.altair_chart(chart, use_container_width=True)
 
 
 def render_phase_filter_table(players, key_prefix="live"):
@@ -355,6 +401,24 @@ def render_dashboards(ranked):
             st.dataframe(phase_df, use_container_width=True)
 
 
+def render_winner_banner(winner):
+    st.markdown(
+        f"""
+        <div style="background:{CARD}; border:1px solid {CARD_LINE}; border-radius:6px;
+                    padding:28px 22px; text-align:center; margin-bottom:18px;">
+            <div style="font-size:44px; line-height:1;">🏆</div>
+            <div style="font-family:Georgia, serif; font-size:26px; color:{INK}; margin-top:6px;">
+                Congratulations, {winner['name']}!
+            </div>
+            <div style="font-size:13.5px; color:{MUTED}; margin-top:4px;">
+                First to clear all {PHASE_COUNT} phases — finishing with {winner['total_score']} points.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Round entry
 # ---------------------------------------------------------------------------
@@ -367,7 +431,8 @@ def render_round_entry(players, round_number):
     st.caption(
         "One player goes out first and scores 0 — everyone else logs what they were left holding. "
         "Check 'Completed' for anyone who cleared their phase; they move up next round. Anyone who "
-        "doesn't stays put, and their score adds to what they've already built up on that phase."
+        "doesn't stays put, and their score adds to what they've already built up on that phase. "
+        "The game ends the moment someone clears phase 10."
     )
 
     with st.form(f"round_form_{round_number}"):
@@ -451,6 +516,33 @@ def render_history(annotated_history):
 # Past games archive
 # ---------------------------------------------------------------------------
 
+def _game_label(g, base_players):
+    players_str = ", ".join(p["name"] for p in base_players)
+    when = str(g["created_at"])[:16].replace("T", " ")
+    status = "Finished" if g["finished_at"] else "In progress"
+    return f"{when} · {players_str} · {status}"
+
+
+def _render_one_game(g, expanded_view=True):
+    base_players = json.loads(g["base_players"])
+    history = json.loads(g["history"]) if g["history"] else []
+    players, annotated_history = replay(base_players, history)
+    ranked = rank_players(players)
+    if not ranked:
+        st.caption("No rounds were played in this game.")
+        return
+    render_leaderboard(ranked)
+    render_bar_chart(ranked, key_prefix=f"game_{g['id']}")
+    render_phase_filter_table(players, key_prefix=f"game_{g['id']}")
+    if annotated_history:
+        st.write("Round-by-round")
+        for r in annotated_history:
+            summary = " · ".join(
+                f"{e['player_name']} +{e['score']}{'✔' if e['completed'] else ''}" for e in r["entries"]
+            )
+            st.caption(f"Round {r['round']}: {summary}")
+
+
 def render_past_games():
     st.title("Past games")
     games = list_games()
@@ -458,30 +550,23 @@ def render_past_games():
         st.info("No games recorded yet — play a game and it'll show up here.")
         return
 
+    labels = ["All games"]
+    label_to_game = {}
     for g in games:
         base_players = json.loads(g["base_players"])
-        history = json.loads(g["history"]) if g["history"] else []
-        players, annotated_history = replay(base_players, history)
-        ranked = rank_players(players)
-        status = "Finished" if g["finished_at"] else "In progress"
-        when = str(g["created_at"])[:16].replace("T", " ")
-        winner = ranked[0]["name"] if ranked else "—"
-        label = f"{when} · {status} · {len(history)} rounds · leader: {winner}"
+        label = _game_label(g, base_players)
+        labels.append(label)
+        label_to_game[label] = g
 
-        with st.expander(label):
-            if not ranked:
-                st.caption("No rounds were played in this game.")
-                continue
-            render_leaderboard(ranked)
-            render_bar_chart(ranked)
-            render_phase_filter_table(players, key_prefix=f"game_{g['id']}")
-            if annotated_history:
-                st.write("Round-by-round")
-                for r in annotated_history:
-                    summary = " · ".join(
-                        f"{e['player_name']} +{e['score']}{'✔' if e['completed'] else ''}" for e in r["entries"]
-                    )
-                    st.caption(f"Round {r['round']}: {summary}")
+    selected = st.selectbox("Filter by game", options=labels)
+
+    if selected == "All games":
+        for g in games:
+            base_players = json.loads(g["base_players"])
+            with st.expander(_game_label(g, base_players)):
+                _render_one_game(g)
+    else:
+        _render_one_game(label_to_game[selected])
 
 
 # ---------------------------------------------------------------------------
@@ -497,8 +582,7 @@ def main():
         st.error("Google Sheets isn't connected yet.")
         st.markdown(
             "Add your service-account credentials and spreadsheet ID to `.streamlit/secrets.toml` "
-            "(locally) or to your app's **Secrets** settings (on Streamlit Community Cloud). "
-            "See the setup steps for the exact format."
+            "(locally) or to your app's **Secrets** settings (on Streamlit Community Cloud)."
         )
         st.stop()
 
@@ -528,21 +612,29 @@ def main():
 
     players, annotated_history = replay(st.session_state.base_players, st.session_state.history)
     ranked = rank_players(players)
-    all_finished = len(players) > 0 and all(p["finished"] for p in players)
+    game_over = len(players) > 0 and any(p["finished"] for p in players)
     next_round = len(st.session_state.history) + 1
 
-    if all_finished and not st.session_state.finished_saved:
+    if game_over and not st.session_state.finished_saved:
         finish_game(st.session_state.game_id)
         st.session_state.finished_saved = True
+        st.session_state.show_celebration = True
 
     top_left, top_right = st.columns([4, 1])
     with top_left:
         st.title("Phase Tracker")
-        st.caption("Game complete" if all_finished else f"Round {next_round}")
+        st.caption("Game complete" if game_over else f"Round {next_round}")
     with top_right:
         if st.button("New game"):
             reset_game()
             st.rerun()
+
+    if game_over:
+        winner = ranked[0]
+        if st.session_state.show_celebration:
+            st.balloons()
+            st.session_state.show_celebration = False
+        render_winner_banner(winner)
 
     render_leaderboard(ranked)
     render_bar_chart(ranked)
@@ -551,9 +643,7 @@ def main():
 
     st.divider()
 
-    if all_finished:
-        st.success(f"Every player has cleared all {PHASE_COUNT} phases. Check the leaderboard above, or start a new game.")
-    else:
+    if not game_over:
         render_round_entry(players, next_round)
 
     st.divider()
