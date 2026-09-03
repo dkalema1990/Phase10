@@ -324,14 +324,15 @@ def render_setup():
 # Leaderboard, chart, filters, dashboards
 # ---------------------------------------------------------------------------
 
-def render_leaderboard(ranked):
+def render_leaderboard(ranked, winner_id=None):
     st.subheader("Leaderboard")
     st.caption("Ranked by furthest phase reached, ties broken by lowest score")
     rows = []
     for i, p in enumerate(ranked):
+        is_winner = p["id"] == winner_id
         rows.append({
             "Rank": i + 1,
-            "Player": p["name"] + (" 🏆" if p["finished"] else ""),
+            "Player": p["name"] + (" 🏆" if is_winner else ""),
             "Phase": "Finished" if p["finished"] else f"{p['current_phase']} / {PHASE_COUNT}",
             "Total score": p["total_score"],
         })
@@ -386,10 +387,15 @@ def render_phase_filter_table(players, key_prefix="live"):
     st.dataframe(df, use_container_width=True)
 
 
-def render_dashboards(ranked):
+def render_dashboards(ranked, winner_id=None):
     st.subheader("Player dashboards")
     for i, p in enumerate(ranked):
-        status = "Completed all phases 🏆" if p["finished"] else f"Phase {p['current_phase']} of {PHASE_COUNT}"
+        if p["id"] == winner_id:
+            status = "Winner — completed all phases 🏆"
+        elif p["finished"]:
+            status = "Completed all phases"
+        else:
+            status = f"Phase {p['current_phase']} of {PHASE_COUNT}"
         with st.expander(f"#{i + 1} · {p['name']} — {p['total_score']} pts — {status}"):
             phase_df = pd.DataFrame(
                 {
@@ -531,7 +537,9 @@ def _render_one_game(g, expanded_view=True):
     if not ranked:
         st.caption("No rounds were played in this game.")
         return
-    render_leaderboard(ranked)
+    game_over = any(p["finished"] for p in players)
+    winner_id = ranked[0]["id"] if game_over else None
+    render_leaderboard(ranked, winner_id=winner_id)
     render_bar_chart(ranked, key_prefix=f"game_{g['id']}")
     render_phase_filter_table(players, key_prefix=f"game_{g['id']}")
     if annotated_history:
@@ -629,17 +637,19 @@ def main():
             reset_game()
             st.rerun()
 
+    winner_id = None
     if game_over:
         winner = ranked[0]
+        winner_id = winner["id"]
         if st.session_state.show_celebration:
             st.balloons()
             st.session_state.show_celebration = False
         render_winner_banner(winner)
 
-    render_leaderboard(ranked)
+    render_leaderboard(ranked, winner_id=winner_id)
     render_bar_chart(ranked)
     render_phase_filter_table(players, key_prefix="live")
-    render_dashboards(ranked)
+    render_dashboards(ranked, winner_id=winner_id)
 
     st.divider()
 
