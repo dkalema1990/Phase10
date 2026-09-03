@@ -577,6 +577,70 @@ def render_past_games():
         _render_one_game(label_to_game[selected])
 
 
+def render_overall_leaderboard():
+    st.title("Overall leaderboard")
+    st.caption("Combined stats across every game recorded — including the one in progress")
+    games = list_games()
+    if not games:
+        st.info("No games recorded yet.")
+        return
+
+    stats = {}
+    for g in games:
+        base_players = json.loads(g["base_players"])
+        history = json.loads(g["history"]) if g["history"] else []
+        players, _ = replay(base_players, history)
+        if not players:
+            continue
+        ranked = rank_players(players)
+        has_winner = any(p["finished"] for p in players)
+        winner_id = ranked[0]["id"] if has_winner else None
+        for p in players:
+            s = stats.setdefault(p["name"], {"games": 0, "wins": 0, "total_score": 0})
+            s["games"] += 1
+            s["total_score"] += p["total_score"]
+            if p["id"] == winner_id:
+                s["wins"] += 1
+
+    if not stats:
+        st.info("No completed rounds yet across any game.")
+        return
+
+    rows = []
+    for name, s in stats.items():
+        avg = s["total_score"] / s["games"] if s["games"] else 0
+        rows.append({
+            "Player": name,
+            "Wins": s["wins"],
+            "Games played": s["games"],
+            "Total score": s["total_score"],
+            "Avg score/game": round(avg, 1),
+        })
+    # Overall rank: most wins first, ties broken by lowest cumulative score
+    rows.sort(key=lambda r: (-r["Wins"], r["Total score"]))
+    for i, r in enumerate(rows):
+        r["Rank"] = i + 1
+
+    df = pd.DataFrame(rows)[["Rank", "Player", "Wins", "Games played", "Total score", "Avg score/game"]].set_index("Rank")
+    st.table(df)
+
+    st.subheader("Wins by player")
+    chart_df = pd.DataFrame({"Player": [r["Player"] for r in rows], "Wins": [r["Wins"] for r in rows]})
+    order = list(chart_df["Player"])
+    bars = (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Player:N", sort=order, title=None, axis=alt.Axis(labelAngle=-20)),
+            y=alt.Y("Wins:Q"),
+            color=alt.Color("Player:N", sort=order, legend=None, scale=alt.Scale(scheme="tableau20")),
+            tooltip=["Player", "Wins"],
+        )
+    )
+    labels = bars.mark_text(dy=-8, color="#F6F1E3", fontSize=13).encode(text="Wins:Q")
+    st.altair_chart((bars + labels).properties(height=320), use_container_width=True)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -608,7 +672,11 @@ def main():
 
     init_state()
 
-    page = st.sidebar.radio("View", ["Play", "Past games"])
+    page = st.sidebar.radio("View", ["Play", "Past games", "Overall leaderboard"])
+
+    if page == "Overall leaderboard":
+        render_overall_leaderboard()
+        return
 
     if page == "Past games":
         render_past_games()
